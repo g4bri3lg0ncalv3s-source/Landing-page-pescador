@@ -67,3 +67,25 @@ def test_respeita_limite_maximo_da_legenda():
     assert len(legenda) <= 300
     assert len(legenda) <= TELEGRAM_CAPTION_MAX_LENGTH
     assert "https://www.mercadolivre.com.br/p/MLB55555" in legenda
+
+
+def test_preserva_link_de_afiliado_integro_mesmo_com_url_muito_longa():
+    """Garante que o encurtamento nunca corte o final da URL de compra/comissão."""
+    url_longa = (
+        "https://produto.mercadolivre.com.br/MLB-9988776655-"
+        + ("vara-de-pesca-carbono-profissional-" * 4)
+        + "?matt_word=afiliado_pesca&matt_tool=88776655"
+    )
+    oferta = Offer(
+        title="Vara de Pesca Carbono Intergreen 2,40m Ação Rápida",
+        price=349.90,
+        original_price=499.90,
+        url=url_longa,
+        source="Mercado Livre",
+    )
+
+    config = CopywritingConfig(max_caption_length=220)
+    legenda = build_offer_caption(oferta, config=config)
+
+    assert legenda.endswith("matt_word=afiliado_pesca&matt_tool=88776655")
+    assert url_longa in legenda

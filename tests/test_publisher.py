@@ -24,6 +24,7 @@ from pesca_bot.publisher import (
     OfferPublisher,
     SimulatedChannelSender,
     is_within_operating_hours,
+    normalize_channel_id,
 )
 
 
@@ -438,3 +439,165 @@ def test_publica_um_post_a_cada_tres_minutos_sem_espamar(
     assert len(sender.sent_messages) == 3
     assert esperas == [180.0, 180.0]
     assert chamadas_coleta[0] == 1
+
+
+def test_queda_de_rede_em_send_photo_nao_dispara_fallback_de_texto(tmp_path: Path):
+    """OPS-02: NetworkError real na foto deve abortar envio em vez de tentar texto."""
+
+    class SenderComQuedaDeRedeNaFoto:
+        def __init__(self) -> None:
+            self.chamadas_foto = 0
+            self.chamadas_texto = 0
+
+        async def can_post_to_channel(self, channel_id: str | int) -> bool:
+            return True
+
+        async def send_offer_photo(
+            self,
+            channel_id: str | int,
+            photo_url: str,
+            caption: str,
+        ) -> str:
+            self.chamadas_foto += 1
+            raise NetworkError("Conexão perdida com api.telegram.org")
+
+        async def send_offer_message(self, channel_id: str | int, text: str) -> str:
+            self.chamadas_texto += 1
+            return "msg-indevida"
+
+    sender = SenderComQuedaDeRedeNaFoto()
+    publisher = OfferPublisher(
+        sender=sender,
+        channel_id="-1003913046292",
+        db_path=tmp_path / "rede_foto.db",
+    )
+
+    oferta = Offer(
+        title="Carretilha Marine Sports Lubina",
+        price=299.0,
+        original_price=399.0,
+        url="https://loja.example/lubina",
+        source="Mercado Livre",
+        image_url="https://cdn.loja.example/lubina.jpg",
+    )
+
+    publicadas = asyncio.run(publisher.publish_approved_offers([oferta]))
+
+    assert publicadas == []
+    assert sender.chamadas_foto == 1
+    assert sender.chamadas_texto == 0
+
+
+def test_republica_apenas_apos_cooldown_15_dias_ou_queda_de_10_porcento(
+    tmp_path: Path,
+):
+    """LOG-04: Bloqueia repetição recente, mas libera se cair >= 10% ou após 15 dias."""
+    relogio = [datetime(2026, 11, 1, 14, 0, 0, tzinfo=BRASILIA_TZ)]
+    sender = SimulatedChannelSender(has_permission=True)
+    publisher = OfferPublisher(
+        sender=sender,
+        channel_id="-1003913046292",
+        db_path=tmp_path / "cooldown.db",
+        now_func=lambda: relogio[0],
+        republish_cooldown_days=15.0,
+        republish_min_drop_percent=10.0,
+    )
+
+    # Dia 1: publica por R$ 200,00
+    oferta_dia_1 = Offer(
+        title="Carretilha Shimano Caius Pesca",
+        price=200.0,
+        original_price=280.0,
+        url="https://www.mercadolivre.com.br/p/MLB777888?matt_tool=11",
+        source="Mercado Livre",
+        product_key="mlb-product:MLB777888",
+    )
+    assert len(asyncio.run(publisher.publish_approved_offers([oferta_dia_1]))) == 1
+
+    # Dia 5 com queda leve (R$ 190,00 = -5%, < 10%) e outro vendedor -> BLOQUEADO
+    relogio[0] = datetime(2026, 11, 6, 14, 0, 0, tzinfo=BRASILIA_TZ)
+    oferta_queda_leve = Offer(
+        title="Carretilha Shimano Caius Pesca",
+        price=190.0,
+        original_price=280.0,
+        url="https://produto.mercadolivre.com.br/MLB-999999-caius?matt_tool=22",
+        source="Mercado Livre",
+        product_key="mlb-product:MLB777888",
+    )
+    assert asyncio.run(publisher.publish_approved_offers([oferta_queda_leve])) == []
+
+    # Dia 5 com queda real >= 10% (R$ 175,00 <= R$ 180,00) -> REPUBLICA!
+    oferta_queda_forte = Offer(
+        title="Carretilha Shimano Caius Pesca",
+        price=175.0,
+        original_price=280.0,
+        url="https://produto.mercadolivre.com.br/MLB-999999-caius?matt_tool=22",
+        source="Mercado Livre",
+        product_key="mlb-product:MLB777888",
+    )
+    assert len(asyncio.run(publisher.publish_approved_offers([oferta_queda_forte]))) == 1
+
+    # Dia 22 (> 15 dias desde 06/11) mesmo por R$ 185,00 -> REPUBLICA pelo cooldown!
+    relogio[0] = datetime(2026, 11, 22, 14, 0, 0, tzinfo=BRASILIA_TZ)
+    oferta_apos_cooldown = Offer(
+        title="Carretilha Shimano Caius Pesca",
+        price=185.0,
+        original_price=280.0,
+        url="https://www.mercadolivre.com.br/p/MLB777888?matt_tool=22",
+        source="Mercado Livre",
+        product_key="mlb-product:MLB777888",
+    )
+    assert len(asyncio.run(publisher.publish_approved_offers([oferta_apos_cooldown]))) == 1
+    assert len(sender.sent_messages) == 3
+
+
+def test_limpa_fila_pendente_a_noite_e_preserva_id_de_grupo_comum(tmp_path: Path):
+    """OPS-06 / LOG-06: Não guarda preços da noite anterior e preserva IDs de grupos."""
+    assert normalize_channel_id("-4123456789") == "-4123456789"
+    assert normalize_channel_id("-1003913046292") == "-1003913046292"
+
+    horarios = [
+        datetime(2026, 11, 1, 21, 58, 0, tzinfo=BRASILIA_TZ),  # Ciclo 1: coleta e posta 1
+        datetime(2026, 11, 1, 22, 1, 0, tzinfo=BRASILIA_TZ),   # Ciclo 2: fora do horário -> limpa fila
+        datetime(2026, 11, 2, 7, 1, 0, tzinfo=BRASILIA_TZ),    # Ciclo 3: manhã -> nova coleta!
+    ]
+    idx = [0]
+
+    def relogio_dinamico() -> datetime:
+        atual = horarios[min(idx[0], len(horarios) - 1)]
+        return atual
+
+    async def avancar_ciclo(_segundos: float) -> None:
+        idx[0] += 1
+
+    coletas = [0]
+
+    def coletar() -> list[Offer]:
+        coletas[0] += 1
+        return [
+            Offer(
+                title=f"Vara de Pesca Safra {coletas[0]} Item {i}",
+                price=100.0 - i,
+                original_price=150.0,
+                url=f"https://loja.example/safra-{coletas[0]}-item-{i}",
+                source="Shopee",
+            )
+            for i in range(2)
+        ]
+
+    sender = SimulatedChannelSender(has_permission=True)
+    publisher = OfferPublisher(
+        sender=sender,
+        channel_id="-1003913046292",
+        db_path=tmp_path / "noturno.db",
+        sleep_func=avancar_ciclo,
+        now_func=relogio_dinamico,
+    )
+
+    asyncio.run(publisher.run_periodic_loop(coletar, max_cycles=3))
+
+    # Deve ter feito 2 coletas (uma às 21:58 e uma nova às 07:01, descartando a sobra da noite)
+    assert coletas[0] == 2
+    assert len(sender.sent_messages) == 2
+    assert "Safra 1" in sender.sent_messages[0]["text"]
+    assert "Safra 2" in sender.sent_messages[1]["text"]

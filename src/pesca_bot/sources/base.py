@@ -10,6 +10,7 @@ Este módulo fornece:
 
 import math
 import re
+import threading
 import time
 from typing import Any, Callable, Protocol
 
@@ -34,7 +35,11 @@ class SourceAPIError(RuntimeError):
 
 
 class RateLimiter:
-    """Controla o intervalo mínimo entre requisições para respeitar limites da API."""
+    """Controla o intervalo mínimo entre requisições para respeitar limites da API.
+
+    É seguro para uso concorrente entre threads (ex.: coletas disparadas por
+    `asyncio.to_thread` a partir do loop periódico e de comandos manuais).
+    """
 
     def __init__(
         self,
@@ -46,21 +51,23 @@ class RateLimiter:
         self._clock = clock
         self._sleeper = sleeper
         self._last_call_time: float | None = None
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
         """Aguarda o tempo necessário antes de permitir a próxima requisição."""
         if self.min_interval_seconds <= 0:
             return
 
-        now = self._clock()
-        if self._last_call_time is not None:
-            elapsed = now - self._last_call_time
-            remaining = self.min_interval_seconds - elapsed
-            if remaining > 0:
-                self._sleeper(remaining)
-                now = self._clock()
+        with self._lock:
+            now = self._clock()
+            if self._last_call_time is not None:
+                elapsed = now - self._last_call_time
+                remaining = self.min_interval_seconds - elapsed
+                if remaining > 0:
+                    self._sleeper(remaining)
+                    now = self._clock()
 
-        self._last_call_time = now
+            self._last_call_time = now
 
 
 def parse_price(raw_value: Any) -> float:

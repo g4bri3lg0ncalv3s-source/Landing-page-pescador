@@ -67,6 +67,8 @@ class Offer:
         available_quantity: Estoque disponível informado pela fonte (opcional).
         sales_count: Volume de vendas informado pela fonte (opcional).
         has_verified_urgency: `True` apenas quando houver promoção com prazo confirmado.
+        product_key: Identificador canônico do produto independente de vendedor
+                     ou link de afiliado (ex.: `mlb-product:MLB123`, `shopee:998877`).
     """
 
     title: str
@@ -79,6 +81,7 @@ class Offer:
     available_quantity: int | None = None
     sales_count: int | None = None
     has_verified_urgency: bool = False
+    product_key: str | None = None
 
     @property
     def discount_percent(self) -> float:
@@ -105,6 +108,8 @@ from pesca_bot.copywriting import (  # noqa: E402
 from pesca_bot.validator import (  # noqa: E402
     canonicalize_url,
     deduplicate_offers,
+    extract_product_key,
+    is_fishing_niche,
     is_valid_image_url,
     is_valid_offer,
     is_valid_url,
@@ -119,8 +124,23 @@ def format_offer(
     return build_offer_caption(offer, config=config)
 
 
-def filter_offers(offers: list[Offer]) -> list[Offer]:
-    """Valida, remove duplicatas e ordena do maior ao menor desconto."""
+def filter_offers(
+    offers: list[Offer],
+    min_discount_percent: float = 0.0,
+    require_fishing_niche: bool = False,
+) -> list[Offer]:
+    """Valida, remove duplicatas e ordena do maior ao menor desconto.
+
+    Args:
+        offers: Ofertas candidatas.
+        min_discount_percent: Desconto real mínimo exigido (%). Quando `> 0`,
+            ofertas sem preço original confiável ou com desconto menor são
+            descartadas. O padrão `0.0` mantém o comportamento original.
+        require_fishing_niche: Quando `True`, descarta produtos cujo título não
+            pertence ao nicho de pesca (ver `is_fishing_niche`).
+    """
+    min_discount = max(0.0, float(min_discount_percent or 0.0))
+
     valid = [
         replace(
             offer,
@@ -132,6 +152,8 @@ def filter_offers(offers: list[Offer]) -> list[Offer]:
         )
         for offer in offers
         if is_valid_offer(offer)
+        and (min_discount <= 0 or offer.discount_percent >= min_discount)
+        and (not require_fishing_niche or is_fishing_niche(offer.title))
     ]
 
     unique_offers = deduplicate_offers(valid)
@@ -151,9 +173,11 @@ __all__ = [
     "calculate_savings_amount",
     "canonicalize_url",
     "deduplicate_offers",
+    "extract_product_key",
     "filter_offers",
     "format_brl",
     "format_offer",
+    "is_fishing_niche",
     "is_valid_image_url",
     "is_valid_offer",
     "is_valid_url",

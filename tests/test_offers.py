@@ -21,7 +21,13 @@ from pesca_bot.sources import (
     parse_price,
     standardize_offer,
 )
-from pesca_bot.validator import canonicalize_url, deduplicate_offers, is_valid_url
+from pesca_bot.validator import (
+    canonicalize_url,
+    deduplicate_offers,
+    extract_product_key,
+    is_fishing_niche,
+    is_valid_url,
+)
 
 
 def test_calcula_desconto_e_economia():
@@ -198,3 +204,74 @@ def test_ofertas_demonstrativas_sao_validas():
     ofertas_demo = filter_offers(get_demo_offers())
     assert len(ofertas_demo) == 3
     assert ofertas_demo[0].discount_percent >= ofertas_demo[1].discount_percent
+
+
+def test_filtro_de_nicho_aprova_pesca_e_barra_falsos_positivos():
+    """Garante bloqueio de produtos fora de pesca (maquiagem, brinquedo, moda)."""
+    assert is_fishing_niche("Alicate Contenção Pega Peixe Com Balança Pesca") is True
+    assert is_fishing_niche("Carretilha Shimano Curado DC 151HG") is True
+    assert is_fishing_niche("Vara Telescópica Carbono 3,00m") is True
+
+    assert is_fishing_niche("Caixa Maleta Organizadora De Maquiagem") is False
+    assert is_fishing_niche("Brinquedo Jogo Pega Peixe Infantil") is False
+    assert is_fishing_niche("Bolsa Feminina Maternidade Impermeável") is False
+    assert is_fishing_niche("Alicate De Unha Manicure Inox") is False
+
+
+def test_deduplica_ignorando_matt_params_e_preserva_link_comissao_e_desconto_minimo():
+    """Deduplica variações de afiliado/vendedor mantendo o link de comissão e desconto >= 5%."""
+    assert (
+        canonicalize_url(
+            "https://www.mercadolivre.com.br/p/MLB123?matt_word=a&matt_tool=1"
+        )
+        == "https://www.mercadolivre.com.br/p/MLB123"
+    )
+    assert (
+        extract_product_key("https://www.mercadolivre.com.br/p/MLB12345")
+        == "mlb-product:MLB12345"
+    )
+
+    oferta_cara = Offer(
+        title="Molinete Shimano FX 4000",
+        price=195.0,
+        original_price=250.0,
+        url="https://www.mercadolivre.com.br/p/MLB12345?matt_word=pesca&matt_tool=10",
+        source="Mercado Livre",
+    )
+    oferta_barata = Offer(
+        title="Molinete Shimano FX 4000 Promo",
+        price=179.0,
+        original_price=250.0,
+        url="https://www.mercadolivre.com.br/p/MLB12345?matt_word=pesca&matt_tool=10&utm_source=ig",
+        source="Mercado Livre",
+    )
+    oferta_desconto_irrisorio = Offer(
+        title="Vara de pesca sem desconto relevante",
+        price=98.0,
+        original_price=100.0,  # 2% < 5%
+        url="https://www.mercadolivre.com.br/p/MLB99999",
+        source="Mercado Livre",
+    )
+    oferta_fora_do_nicho = Offer(
+        title="Maleta Caixa De Maquiagem Profissional",
+        price=50.0,
+        original_price=150.0,
+        url="https://www.mercadolivre.com.br/p/MLB88888",
+        source="Mercado Livre",
+    )
+
+    filtradas = filter_offers(
+        [
+            oferta_cara,
+            oferta_barata,
+            oferta_desconto_irrisorio,
+            oferta_fora_do_nicho,
+        ],
+        min_discount_percent=5.0,
+        require_fishing_niche=True,
+    )
+
+    assert len(filtradas) == 1
+    assert filtradas[0].price == 179.0
+    assert "matt_word=pesca" in filtradas[0].url
+    assert "matt_tool=10" in filtradas[0].url

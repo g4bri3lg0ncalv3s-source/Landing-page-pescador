@@ -12,14 +12,14 @@ import hashlib
 import json
 import logging
 import os
-from pathlib import Path
+import threading
 import time
 from typing import Any, Callable
 
-from dotenv import load_dotenv
 import httpx
 
-from pesca_bot.offers import Offer
+from pesca_bot.config import load_env
+from pesca_bot.offers import Offer, extract_product_key
 from pesca_bot.sources.base import (
     RateLimiter,
     SourceAPIError,
@@ -30,8 +30,7 @@ from pesca_bot.sources.base import (
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-load_dotenv(PROJECT_ROOT / ".env", override=True)
+load_env()
 
 SHOPEE_GRAPHQL_ENDPOINT = "https://open-api.affiliate.shopee.com.br/graphql"
 
@@ -63,6 +62,7 @@ class ShopeeAffiliateClient:
         http_client: httpx.Client | None = None,
         rate_limiter: RateLimiter | None = None,
         time_provider: Callable[[], int] | None = None,
+        only_discounted: bool = True,
     ) -> None:
         self._app_id = (
             app_id if app_id is not None else os.getenv("SHOPEE_APP_ID", "")
@@ -72,8 +72,28 @@ class ShopeeAffiliateClient:
         ).strip()
         self.endpoint = endpoint
         self._http_client = http_client
+        self._owns_http_client = False
+        self._client_lock = threading.Lock()
         self._rate_limiter = rate_limiter or RateLimiter(min_interval_seconds=1.0)
         self._time_provider = time_provider or (lambda: int(time.time()))
+        self.only_discounted = only_discounted
+
+    def _get_client(self) -> httpx.Client:
+        """Retorna um `httpx.Client` reutilizável (connection pooling)."""
+        if self._http_client is None:
+            with self._client_lock:
+                if self._http_client is None:
+                    self._http_client = httpx.Client(timeout=15.0)
+                    self._owns_http_client = True
+        return self._http_client
+
+    def close(self) -> None:
+        """Fecha o cliente HTTP interno (quando criado por esta instância)."""
+        with self._client_lock:
+            if self._owns_http_client and self._http_client is not None:
+                self._http_client.close()
+                self._http_client = None
+                self._owns_http_client = False
 
     def _validate_credentials(self) -> None:
         """Garante que as credenciais da Shopee foram configuradas antes da chamada."""
@@ -116,20 +136,12 @@ class ShopeeAffiliateClient:
         }
 
         try:
-            if self._http_client is not None:
-                response = self._http_client.post(
-                    self.endpoint,
-                    content=payload_json.encode("utf-8"),
-                    headers=headers,
-                    timeout=15.0,
-                )
-            else:
-                with httpx.Client(timeout=15.0) as client:
-                    response = client.post(
-                        self.endpoint,
-                        content=payload_json.encode("utf-8"),
-                        headers=headers,
-                    )
+            response = self._get_client().post(
+                self.endpoint,
+                content=payload_json.encode("utf-8"),
+                headers=headers,
+                timeout=15.0,
+            )
         except httpx.HTTPError as exc:
             logger.error("Falha de rede ao consultar API da Shopee: %s", type(exc).__name__)
             raise SourceAPIError("Erro de conexão ao consultar a API da Shopee.") from exc
@@ -192,9 +204,25 @@ class ShopeeAffiliateClient:
 
         offers: list[Offer] = []
         for node in nodes:
-            offer = self._parse_node_to_offer(node)
-            if offer is not None:
-                offers.append(offer)
+            offer = self._parse_node_to_offer(
+                node,
+                only_discounted=self.only_discounted,
+            )
+            if offer is None:
+                continue
+
+            if not str(node.get("offerLink") or "").strip():
+                product_link = str(node.get("productLink") or "").strip()
+                if product_link:
+                    try:
+                        short_url = self.generate_short_link(product_link)
+                        offer.url = short_url
+                    except SourceAPIError:
+                        logger.warning(
+                            "Falha ao gerar shortLink da Shopee; mantendo productLink."
+                        )
+
+            offers.append(offer)
 
         logger.info("Shopee retornou %s ofertas para o termo '%s'.", len(offers), clean_keyword)
         return offers
@@ -228,11 +256,19 @@ class ShopeeAffiliateClient:
         return short_link
 
     @staticmethod
-    def _parse_node_to_offer(node: dict[str, Any]) -> Offer | None:
-        """Converte um item do `productOfferV2` no modelo padronizado `Offer`."""
+    def _parse_node_to_offer(
+        node: dict[str, Any],
+        only_discounted: bool = True,
+    ) -> Offer | None:
+        """Converte um item do `productOfferV2` no modelo padronizado `Offer`.
+
+        Importante: `priceMax` na Shopee representa o maior preço entre variações
+        (SKUs diferentes) do mesmo anúncio e NUNCA deve ser usado como preço
+        original de promoção. O desconto real vem exclusivamente de
+        `priceDiscountRate`.
+        """
         title = " ".join(str(node.get("productName") or "").split())
         price = parse_price(node.get("priceMin"))
-        price_max = parse_price(node.get("priceMax"))
         discount_rate = parse_price(node.get("priceDiscountRate"))
 
         if price <= 0 or not title:
@@ -240,10 +276,11 @@ class ShopeeAffiliateClient:
 
         if 0 < discount_rate < 100:
             original_price = round(price / (1.0 - (discount_rate / 100.0)), 2)
-        elif price_max > price:
-            original_price = price_max
         else:
             original_price = 0.0
+
+        if only_discounted and original_price <= price:
+            return None
 
         url = str(node.get("offerLink") or node.get("productLink") or "").strip()
         if not url:
@@ -259,6 +296,13 @@ class ShopeeAffiliateClient:
         if isinstance(raw_sales, int) and not isinstance(raw_sales, bool) and raw_sales > 0:
             sales_count = raw_sales
 
+        item_id = str(node.get("itemId") or "").strip()
+        product_key = (
+            f"shopee:{item_id}"
+            if item_id
+            else (extract_product_key(url, source_label) or None)
+        )
+
         return Offer(
             title=title,
             price=price,
@@ -267,4 +311,5 @@ class ShopeeAffiliateClient:
             source=source_label,
             image_url=image_url,
             sales_count=sales_count,
+            product_key=product_key,
         )

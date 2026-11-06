@@ -1,44 +1,57 @@
 """Motor de publicação automatizada de ofertas (com imagem e fallback) no Telegram.
 
 Responsabilidades deste módulo:
-- Ler o identificador do canal (`TELEGRAM_CHANNEL_ID`) e o intervalo
-  (`PUBLISH_INTERVAL_SECONDS`) a partir do `.env`;
-- Verificar se o bot possui permissão de administrador para postar no canal;
+- Ler o identificador do canal (`TELEGRAM_CHANNEL_ID`), o intervalo
+  (`PUBLISH_INTERVAL_SECONDS`), o desconto mínimo (`COPY_MIN_DISCOUNT_PERCENT`)
+  e as regras de republicação a partir do `.env`;
+- Verificar se o bot possui permissão de administrador para postar no canal
+  (com cache em memória para não sobrecarregar a API do Telegram);
 - Publicar ofertas com imagem (`send_photo`) quando houver `image_url` válida;
-- Realizar fallback automático para texto (`send_message`) caso a oferta não
-  tenha imagem ou caso a imagem esteja indisponível no servidor de origem;
-- Registrar cada envio na tabela `publications` do SQLite (evitando duplicatas
-  mesmo se o bot for reiniciado);
-- Tratar limites de envio do Telegram (`RetryAfter`), quedas de rede e timeouts;
-- Permitir pausar (`pause()`) e retomar (`resume()`) as publicações.
+- Realizar fallback automático para texto (`send_message`) apenas quando a
+  imagem for inválida/recusada, sem repetir envios durante quedas de rede;
+- Registrar cada envio na tabela `publications` do SQLite (respeitando cooldown
+  de republicação e gatilho de queda adicional de preço);
+- Proteger contra concorrência (`asyncio.Lock`) entre `/publicar` e o loop
+  periódico, além de expirar filas de ofertas antigas na memória.
 """
 
 import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
-import os
 from pathlib import Path
+import time
 from typing import Any, Awaitable, Callable, Protocol
 
-from dotenv import load_dotenv
 from telegram import Bot
-from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.error import (
+    BadRequest,
+    Forbidden,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 
+from pesca_bot.config import env_float, env_str, load_env, reload_env
 from pesca_bot.database import (
     DATABASE_PATH,
     initialize_database,
-    is_offer_published,
     record_publication,
     save_offer,
+    should_publish_offer,
 )
 from pesca_bot.offers import Offer, filter_offers, format_offer, is_valid_image_url
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(PROJECT_ROOT / ".env", override=True)
+load_env()
 
 DEFAULT_PUBLISH_INTERVAL_SECONDS = 180.0
+DEFAULT_MIN_DISCOUNT_PERCENT = 5.0
+DEFAULT_REPUBLISH_COOLDOWN_DAYS = 15.0
+DEFAULT_REPUBLISH_MIN_PRICE_DROP_PERCENT = 10.0
+DEFAULT_PENDING_OFFERS_TTL_SECONDS = 1800.0
+PERMISSION_CACHE_TTL_SECONDS = 300.0
 
 # Fuso horário oficial de Brasília (UTC-3) e janela de exibição das promoções (07:00 às 22:00)
 BRASILIA_TZ = timezone(timedelta(hours=-3), name="BRT")
@@ -72,21 +85,15 @@ def is_within_operating_hours(
 
 
 def normalize_channel_id(raw_channel_id: str | int | None) -> str:
-    """Padroniza o identificador do canal do Telegram.
+    """Limpa o identificador do canal ou grupo do Telegram sem adulterar IDs de grupos.
 
-    Na API de Bots do Telegram, todo ID numérico de canal começa com `-100`.
-    Se o usuário copiar o ID pelo Telegram Web (ex.: `-3913046292`),
-    esta função converte automaticamente para `-1003913046292`.
+    Aceita `@username` (ex.: `@canal_pesca`), IDs de canais/supergrupos
+    (`-100...`) ou IDs negativos de grupos comuns (`-...`) exatamente como
+    exigidos pela Bot API do Telegram.
     """
     if raw_channel_id is None:
         return ""
-    value = str(raw_channel_id).strip()
-    if not value:
-        return ""
-    if value.startswith("-") and value[1:].isdigit() and not value.startswith("-100"):
-        if len(value[1:]) >= 10:
-            return f"-100{value[1:]}"
-    return value
+    return str(raw_channel_id).strip()
 
 
 class ChannelSender(Protocol):
@@ -94,6 +101,14 @@ class ChannelSender(Protocol):
 
     async def can_post_to_channel(self, channel_id: str | int) -> bool:
         """Retorna `True` se o bot tiver permissão para publicar no canal."""
+
+    async def send_offer_photo(
+        self,
+        channel_id: str | int,
+        photo_url: str,
+        caption: str,
+    ) -> str | int | None:
+        """Envia a foto com legenda ao canal e retorna o ID da mensagem gerada."""
 
     async def send_offer_message(
         self,
@@ -161,19 +176,55 @@ class SimulatedChannelSender:
 class TelegramChannelSender:
     """Adaptador oficial que utiliza `telegram.Bot` (`send_photo` e `send_message`)."""
 
-    def __init__(self, bot: Bot) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        permission_cache_ttl: float = PERMISSION_CACHE_TTL_SECONDS,
+    ) -> None:
         self._bot = bot
+        self._bot_user_id: int | None = None
+        self._permission_cache_ttl = max(0.0, float(permission_cache_ttl))
+        self._verified_channel: str | None = None
+        self._verified_until: float = 0.0
+
+    def invalidate_permission_cache(self) -> None:
+        """Limpa o cache de permissão do canal (ex.: após erro `Forbidden`)."""
+        self._verified_channel = None
+        self._verified_until = 0.0
 
     async def can_post_to_channel(self, channel_id: str | int) -> bool:
-        """Consulta o Telegram para confirmar se o bot é administrador com permissão de postagem."""
-        bot_user = await self._bot.get_me()
-        member = await self._bot.get_chat_member(chat_id=channel_id, user_id=bot_user.id)
+        """Consulta o Telegram (com cache) para confirmar permissão de postagem."""
+        channel_key = str(channel_id).strip()
+        now_mono = time.monotonic()
+
+        if (
+            self._permission_cache_ttl > 0
+            and self._verified_channel == channel_key
+            and now_mono < self._verified_until
+        ):
+            return True
+
+        if self._bot_user_id is None:
+            bot_user = await self._bot.get_me()
+            self._bot_user_id = bot_user.id
+
+        member = await self._bot.get_chat_member(
+            chat_id=channel_id,
+            user_id=self._bot_user_id,
+        )
 
         if member.status not in ("administrator", "creator"):
+            self.invalidate_permission_cache()
             return False
 
         can_post = getattr(member, "can_post_messages", None)
-        return can_post is not False
+        allowed = can_post is not False
+        if allowed and self._permission_cache_ttl > 0:
+            self._verified_channel = channel_key
+            self._verified_until = now_mono + self._permission_cache_ttl
+        else:
+            self.invalidate_permission_cache()
+        return allowed
 
     async def send_offer_photo(
         self,
@@ -197,14 +248,23 @@ class TelegramChannelSender:
 
 def _load_interval_from_env() -> float:
     """Lê o intervalo de publicação (`PUBLISH_INTERVAL_SECONDS`) do `.env`."""
-    raw = os.getenv("PUBLISH_INTERVAL_SECONDS", "").strip()
-    if not raw:
-        return DEFAULT_PUBLISH_INTERVAL_SECONDS
-    try:
-        value = float(raw)
-        return value if value > 0 else DEFAULT_PUBLISH_INTERVAL_SECONDS
-    except ValueError:
-        return DEFAULT_PUBLISH_INTERVAL_SECONDS
+    value = env_float(
+        "PUBLISH_INTERVAL_SECONDS",
+        DEFAULT_PUBLISH_INTERVAL_SECONDS,
+    )
+    return value if value > 0 else DEFAULT_PUBLISH_INTERVAL_SECONDS
+
+
+def extract_retry_seconds(exc: RetryAfter) -> float:
+    """Extrai o tempo de espera em segundos de uma exceção `RetryAfter`."""
+    raw_wait = getattr(exc, "_retry_after", None)
+    if raw_wait is None:
+        raw_wait = getattr(exc, "retry_after", 1.0)
+    return (
+        float(raw_wait.total_seconds())
+        if hasattr(raw_wait, "total_seconds")
+        else float(raw_wait)
+    )
 
 
 class OfferPublisher:
@@ -212,19 +272,28 @@ class OfferPublisher:
 
     def __init__(
         self,
-        sender: ChannelSender,
+        sender: Any,
         channel_id: str | int | None = None,
         db_path: Path | str | None = None,
         interval_seconds: float | None = None,
         sleep_func: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now_func: Callable[[], datetime] = get_brasilia_now,
+        min_discount_percent: float | None = None,
+        require_fishing_niche: bool = True,
+        republish_cooldown_days: float | None = None,
+        republish_min_drop_percent: float | None = None,
+        pending_ttl_seconds: float = DEFAULT_PENDING_OFFERS_TTL_SECONDS,
     ) -> None:
         self._custom_channel_id = channel_id is not None
         self._custom_interval = interval_seconds is not None and interval_seconds > 0
+        self._custom_min_discount = min_discount_percent is not None
+        self._custom_cooldown = republish_cooldown_days is not None
+        self._custom_min_drop = republish_min_drop_percent is not None
+
         raw_channel = (
             str(channel_id)
             if channel_id is not None
-            else os.getenv("TELEGRAM_CHANNEL_ID", "")
+            else env_str("TELEGRAM_CHANNEL_ID")
         )
         self.channel_id = normalize_channel_id(raw_channel)
         self.db_path = Path(db_path) if db_path is not None else DATABASE_PATH
@@ -233,24 +302,71 @@ class OfferPublisher:
             if self._custom_interval and interval_seconds is not None
             else _load_interval_from_env()
         )
+        self.min_discount_percent = (
+            max(0.0, float(min_discount_percent))
+            if min_discount_percent is not None
+            else env_float(
+                "COPY_MIN_DISCOUNT_PERCENT",
+                DEFAULT_MIN_DISCOUNT_PERCENT,
+                min_value=0.0,
+            )
+        )
+        self.require_fishing_niche = require_fishing_niche
+        self.republish_cooldown_days = (
+            max(0.0, float(republish_cooldown_days))
+            if republish_cooldown_days is not None
+            else env_float(
+                "REPUBLISH_COOLDOWN_DAYS",
+                DEFAULT_REPUBLISH_COOLDOWN_DAYS,
+                min_value=0.0,
+            )
+        )
+        self.republish_min_drop_percent = (
+            max(0.0, float(republish_min_drop_percent))
+            if republish_min_drop_percent is not None
+            else env_float(
+                "REPUBLISH_MIN_PRICE_DROP_PERCENT",
+                DEFAULT_REPUBLISH_MIN_PRICE_DROP_PERCENT,
+                min_value=0.0,
+            )
+        )
+        self.pending_ttl_seconds = max(0.0, float(pending_ttl_seconds))
+
         self._sender = sender
         self._sleep = sleep_func
         self._now = now_func
         self._paused = False
+        self._publish_lock = asyncio.Lock()
 
     def is_operating_hours(self) -> bool:
         """Retorna `True` se o horário atual de Brasília estiver entre 07:00 e 22:00."""
         return is_within_operating_hours(self._now())
 
     def reload_env(self) -> None:
-        """Recarrega o `TELEGRAM_CHANNEL_ID` e o intervalo diretamente do arquivo `.env`."""
-        load_dotenv(PROJECT_ROOT / ".env", override=True)
+        """Recarrega configurações operacionais diretamente do `.env`."""
+        reload_env()
         if not self._custom_channel_id:
-            self.channel_id = normalize_channel_id(
-                os.getenv("TELEGRAM_CHANNEL_ID", "")
-            )
+            self.channel_id = normalize_channel_id(env_str("TELEGRAM_CHANNEL_ID"))
         if not self._custom_interval:
             self.interval_seconds = _load_interval_from_env()
+        if not self._custom_min_discount:
+            self.min_discount_percent = env_float(
+                "COPY_MIN_DISCOUNT_PERCENT",
+                DEFAULT_MIN_DISCOUNT_PERCENT,
+                min_value=0.0,
+            )
+        if not self._custom_cooldown:
+            self.republish_cooldown_days = env_float(
+                "REPUBLISH_COOLDOWN_DAYS",
+                DEFAULT_REPUBLISH_COOLDOWN_DAYS,
+                min_value=0.0,
+            )
+        if not self._custom_min_drop:
+            self.republish_min_drop_percent = env_float(
+                "REPUBLISH_MIN_PRICE_DROP_PERCENT",
+                DEFAULT_REPUBLISH_MIN_PRICE_DROP_PERCENT,
+                min_value=0.0,
+            )
 
     @property
     def is_paused(self) -> bool:
@@ -292,21 +408,16 @@ class OfferPublisher:
 
         return True
 
-    @staticmethod
-    def _extract_retry_seconds(exc: RetryAfter) -> float:
-        raw_wait = getattr(exc, "_retry_after", None) or getattr(exc, "retry_after", 1.0)
-        return (
-            float(raw_wait.total_seconds())
-            if hasattr(raw_wait, "total_seconds")
-            else float(raw_wait)
-        )
+    def _invalidate_sender_cache(self) -> None:
+        if hasattr(self._sender, "invalidate_permission_cache"):
+            self._sender.invalidate_permission_cache()
 
     async def _send_text_with_retry(self, text: str) -> str | int | None:
         """Envia uma mensagem de texto tratando limites de taxa (`RetryAfter`) e erros de rede."""
         try:
             return await self._sender.send_offer_message(self.channel_id, text)
         except RetryAfter as exc:
-            wait_seconds = self._extract_retry_seconds(exc)
+            wait_seconds = extract_retry_seconds(exc)
             logger.warning(
                 "Limite da API do Telegram atingido (RetryAfter). Aguardando %.1fs para reenviar.",
                 wait_seconds,
@@ -315,12 +426,16 @@ class OfferPublisher:
             try:
                 return await self._sender.send_offer_message(self.channel_id, text)
             except (TimedOut, NetworkError, TelegramError, OSError) as retry_exc:
+                if isinstance(retry_exc, Forbidden):
+                    self._invalidate_sender_cache()
                 logger.error(
                     "Falha ao reenviar oferta após espera de limite: %s",
                     type(retry_exc).__name__,
                 )
                 return None
         except (TimedOut, NetworkError, TelegramError, OSError) as exc:
+            if isinstance(exc, Forbidden):
+                self._invalidate_sender_cache()
             logger.error(
                 "Falha ao enviar oferta para o canal %s: %s",
                 self.channel_id,
@@ -329,7 +444,14 @@ class OfferPublisher:
             return None
 
     async def _send_offer(self, offer: Offer, caption: str) -> str | int | None:
-        """Tenta publicar com foto (`send_photo`) quando disponível, com fallback para texto."""
+        """Tenta publicar com foto (`send_photo`) quando disponível, com fallback para texto.
+
+        Atenção à hierarquia de exceções do `python-telegram-bot`:
+        - `BadRequest` herda de `NetworkError` (que herda de `TelegramError`);
+        - Por isso `BadRequest` é capturado ANTES de `(TimedOut, Forbidden, NetworkError)`,
+          garantindo fallback para texto apenas quando a imagem é inválida/indisponível
+          e abortando imediatamente quando a internet cai ou falta permissão no canal.
+        """
         has_photo_method = hasattr(self._sender, "send_offer_photo")
         if is_valid_image_url(offer.image_url) and offer.image_url and has_photo_method:
             photo_url = offer.image_url.strip()
@@ -337,7 +459,7 @@ class OfferPublisher:
             try:
                 return await send_photo_fn(self.channel_id, photo_url, caption)
             except RetryAfter as exc:
-                wait_seconds = self._extract_retry_seconds(exc)
+                wait_seconds = extract_retry_seconds(exc)
                 logger.warning(
                     "Limite da API atingido no envio de foto. Aguardando %.1fs...",
                     wait_seconds,
@@ -345,43 +467,86 @@ class OfferPublisher:
                 await self._sleep(wait_seconds)
                 try:
                     return await send_photo_fn(self.channel_id, photo_url, caption)
-                except (BadRequest, TimedOut, NetworkError, TelegramError, OSError):
+                except BadRequest as retry_bad_exc:
                     logger.warning(
-                        "Não foi possível enviar a imagem de '%s' após espera; usando fallback de texto.",
+                        "Imagem recusada para '%s' após espera (%s); usando fallback de texto.",
                         offer.title,
+                        type(retry_bad_exc).__name__,
                     )
-            except (BadRequest, TelegramError, ValueError) as exc:
-                # Se a imagem falhar (ex.: URL expirada ou recusada pelo Telegram),
-                # registra um aviso e publica normalmente em formato de texto!
+                except (TimedOut, Forbidden, NetworkError, RetryAfter, OSError) as retry_net_exc:
+                    if isinstance(retry_net_exc, Forbidden):
+                        self._invalidate_sender_cache()
+                    logger.error(
+                        "Falha de conexão ou permissão ao reenviar foto no canal %s: %s",
+                        self.channel_id,
+                        type(retry_net_exc).__name__,
+                    )
+                    return None
+                except (TelegramError, ValueError) as retry_other_exc:
+                    logger.warning(
+                        "Não foi possível enviar a imagem de '%s' (%s); usando fallback de texto.",
+                        offer.title,
+                        type(retry_other_exc).__name__,
+                    )
+            except BadRequest as exc:
                 logger.warning(
                     "Imagem indisponível para '%s' (%s); publicando em formato de texto.",
                     offer.title,
                     type(exc).__name__,
                 )
-            except (TimedOut, NetworkError, OSError) as exc:
+            except (TimedOut, Forbidden, NetworkError, OSError) as exc:
+                if isinstance(exc, Forbidden):
+                    self._invalidate_sender_cache()
                 logger.error(
-                    "Falha de conexão ao enviar foto para o canal %s: %s",
+                    "Falha de conexão ou permissão ao enviar foto para o canal %s: %s",
                     self.channel_id,
                     type(exc).__name__,
                 )
                 return None
+            except (TelegramError, ValueError) as exc:
+                logger.warning(
+                    "Imagem indisponível para '%s' (%s); publicando em formato de texto.",
+                    offer.title,
+                    type(exc).__name__,
+                )
 
         return await self._send_text_with_retry(caption)
+
+    def _filter_candidates(self, offers: list[Offer]) -> list[Offer]:
+        return filter_offers(
+            offers,
+            min_discount_percent=self.min_discount_percent,
+            require_fishing_niche=self.require_fishing_niche,
+        )
+
+    def _can_publish_now(self, offer: Offer) -> bool:
+        if not self.channel_id:
+            return True
+        return should_publish_offer(
+            offer=offer,
+            channel_id=self.channel_id,
+            cooldown_days=self.republish_cooldown_days,
+            min_price_drop_percent=self.republish_min_drop_percent,
+            db_path=self.db_path,
+            now=self._now(),
+        )
 
     async def publish_approved_offers(
         self,
         offers: list[Offer],
         max_offers: int | None = None,
+        ignore_pause: bool = False,
     ) -> list[Offer]:
-        """Filtra ofertas válidas, ignora as já publicadas e envia as inéditas ao canal.
+        """Filtra ofertas válidas, aplica regras de republicação e envia ao canal.
 
         Args:
             offers: Lista de ofertas candidatas coletadas das fontes.
-            max_offers: Quantidade máxima de postagens a enviar nesta chamada
-                (ex.: `1` para enviar apenas 1 post por intervalo). Se `None`,
-                envia todas as inéditas da lista.
+            max_offers: Quantidade máxima de postagens nesta chamada.
+            ignore_pause: Quando `True` (usado pelo comando administrativo `/publicar`),
+                permite publicar mesmo que o loop periódico esteja pausado, sem
+                precisar alternar o estado `_paused`.
         """
-        if self._paused:
+        if self._paused and not ignore_pause:
             logger.info("Publicação ignorada: o publicador está pausado.")
             return []
 
@@ -394,63 +559,78 @@ class OfferPublisher:
         if max_offers is not None and max_offers <= 0:
             return []
 
-        initialize_database(self.db_path)
+        async with self._publish_lock:
+            if self._paused and not ignore_pause:
+                return []
 
-        valid_offers = filter_offers(offers)
-        if not valid_offers:
-            logger.info("Nenhuma oferta válida para publicar no canal.")
-            return []
+            initialize_database(self.db_path)
 
-        if not await self.verify_channel_permission():
-            return []
+            valid_offers = self._filter_candidates(offers)
+            if not valid_offers:
+                logger.info("Nenhuma oferta válida para publicar no canal.")
+                return []
 
-        published_now: list[Offer] = []
+            if not await self.verify_channel_permission():
+                return []
 
-        for offer in valid_offers:
-            if is_offer_published(offer.url, self.channel_id, db_path=self.db_path):
-                logger.info("Oferta já publicada anteriormente (ignorando): %s", offer.url)
-                continue
+            published_now: list[Offer] = []
 
-            save_offer(offer, db_path=self.db_path)
-            caption = format_offer(offer)
-            message_id = await self._send_offer(offer, caption)
+            for offer in valid_offers:
+                if not self._can_publish_now(offer):
+                    logger.info(
+                        "Oferta em período de cooldown no canal (ignorando): %s",
+                        offer.url,
+                    )
+                    continue
 
-            if message_id is None:
-                continue
+                save_offer(offer, db_path=self.db_path)
+                caption = format_offer(offer)
+                message_id = await self._send_offer(offer, caption)
 
-            record_publication(
-                offer=offer,
-                channel_id=self.channel_id,
-                message_id=message_id,
-                db_path=self.db_path,
-            )
-            logger.info(
-                "Oferta publicada com sucesso no canal %s: %s (msg_id=%s)",
-                self.channel_id,
-                offer.title,
-                message_id,
-            )
-            published_now.append(offer)
+                if message_id is None:
+                    continue
 
-            if max_offers is not None and len(published_now) >= max_offers:
-                break
+                record_publication(
+                    offer=offer,
+                    channel_id=self.channel_id,
+                    message_id=message_id,
+                    db_path=self.db_path,
+                    published_at=self._now(),
+                )
+                logger.info(
+                    "Oferta publicada com sucesso no canal %s: %s (msg_id=%s)",
+                    self.channel_id,
+                    offer.title,
+                    message_id,
+                )
+                published_now.append(offer)
 
-        return published_now
+                if max_offers is not None and len(published_now) >= max_offers:
+                    break
+
+            return published_now
 
     async def run_periodic_loop(
         self,
         fetch_offers_callback: Callable[[], list[Offer]],
         max_cycles: int | None = None,
     ) -> None:
-        """Publica no máximo 1 oferta inédita a cada `interval_seconds` (padrão: 180s = 3 min)."""
+        """Publica no máximo 1 oferta elegível a cada `interval_seconds` (padrão: 180s = 3 min)."""
         cycles = 0
         pending_offers: list[Offer] = []
+        pending_fetched_at: datetime | None = None
 
         while max_cycles is None or cycles < max_cycles:
             cycles += 1
+            self.reload_env()
+
             if self._paused:
                 logger.info("Ciclo %s ignorado porque as publicações estão pausadas.", cycles)
             elif not self.is_operating_hours():
+                # Descarta fila pendente ao sair da janela 07:00-22:00 para nunca
+                # publicar pela manhã preços coletados na noite anterior.
+                pending_offers = []
+                pending_fetched_at = None
                 logger.info(
                     "Ciclo %s ignorado: fora do horário permitido (07:00 às 22:00 - Horário de Brasília).",
                     cycles,
@@ -458,21 +638,34 @@ class OfferPublisher:
             else:
                 try:
                     initialize_database(self.db_path)
+                    now_dt = self._now()
+
+                    if (
+                        pending_offers
+                        and pending_fetched_at is not None
+                        and self.pending_ttl_seconds > 0
+                        and (now_dt - pending_fetched_at).total_seconds()
+                        >= self.pending_ttl_seconds
+                    ):
+                        logger.info(
+                            "Fila em memória expirou após %.0fs; renovando coleta.",
+                            self.pending_ttl_seconds,
+                        )
+                        pending_offers = []
+                        pending_fetched_at = None
+
                     if self.channel_id:
                         pending_offers = [
-                            o
-                            for o in pending_offers
-                            if not is_offer_published(o.url, self.channel_id, db_path=self.db_path)
+                            o for o in pending_offers if self._can_publish_now(o)
                         ]
 
                     if not pending_offers:
                         fetched = await asyncio.to_thread(fetch_offers_callback)
-                        pending_offers = filter_offers(fetched)
+                        pending_fetched_at = self._now()
+                        pending_offers = self._filter_candidates(fetched)
                         if self.channel_id:
                             pending_offers = [
-                                o
-                                for o in pending_offers
-                                if not is_offer_published(o.url, self.channel_id, db_path=self.db_path)
+                                o for o in pending_offers if self._can_publish_now(o)
                             ]
 
                     if pending_offers:
@@ -482,10 +675,10 @@ class OfferPublisher:
                         )
                         if published and self.channel_id:
                             pending_offers = [
-                                o
-                                for o in pending_offers
-                                if not is_offer_published(o.url, self.channel_id, db_path=self.db_path)
+                                o for o in pending_offers if self._can_publish_now(o)
                             ]
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
                         "Erro inesperado durante o ciclo de coleta/publicação: %s",

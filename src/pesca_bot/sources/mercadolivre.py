@@ -11,14 +11,14 @@ Documentação oficial:
 
 import logging
 import os
-from pathlib import Path
-from typing import Any, Callable
+import threading
+from typing import Any, Callable, Protocol
 
-from dotenv import load_dotenv
 import httpx
 
 from pesca_bot.affiliate import build_mercadolivre_affiliate_url
-from pesca_bot.offers import Offer
+from pesca_bot.config import load_env
+from pesca_bot.offers import Offer, extract_product_key
 from pesca_bot.sources.base import (
     RateLimiter,
     SourceAPIError,
@@ -29,11 +29,20 @@ from pesca_bot.sources.base import (
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-load_dotenv(PROJECT_ROOT / ".env", override=True)
+load_env()
 
 MERCADOLIVRE_API_BASE_URL = "https://api.mercadolibre.com"
 MERCADOLIVRE_SITE_ID = "MLB"
+
+
+class TokenStore(Protocol):
+    """Contrato de armazenamento persistente dos tokens OAuth rotativos."""
+
+    def load(self) -> tuple[str, str]:
+        """Retorna `(access_token, refresh_token)`."""
+
+    def save(self, access_token: str, refresh_token: str) -> None:
+        """Persiste o par de tokens mais recente."""
 
 
 class MercadoLivreClient:
@@ -41,6 +50,10 @@ class MercadoLivreClient:
 
     Nunca registra `access_token`, `client_secret` ou `refresh_token` em logs
     ou mensagens de exceção.
+
+    Quando um `token_store` é informado, os tokens renovados automaticamente
+    (o `refresh_token` do Mercado Livre é de uso único) são persistidos e
+    reutilizados entre reinícios do bot.
     """
 
     source_name = "Mercado Livre"
@@ -57,6 +70,7 @@ class MercadoLivreClient:
         rate_limiter: RateLimiter | None = None,
         affiliate_link_builder: Callable[[str, str], str] | None = None,
         only_discounted: bool = True,
+        token_store: TokenStore | None = None,
     ) -> None:
         self._access_token = (
             access_token
@@ -77,14 +91,42 @@ class MercadoLivreClient:
             else os.getenv("MERCADOLIVRE_REFRESH_TOKEN", "")
         ).strip()
 
+        self._token_store = token_store
+        if token_store is not None:
+            stored_access, stored_refresh = token_store.load()
+            if stored_access:
+                self._access_token = stored_access.strip()
+            if stored_refresh:
+                self._refresh_token = stored_refresh.strip()
+
         self.base_url = base_url.rstrip("/")
         self.site_id = site_id
         self._http_client = http_client
+        self._owns_http_client = False
+        self._client_lock = threading.Lock()
+        self._token_lock = threading.Lock()
         self._rate_limiter = rate_limiter or RateLimiter(min_interval_seconds=0.15)
         self._affiliate_link_builder = (
             affiliate_link_builder or build_mercadolivre_affiliate_url
         )
         self.only_discounted = only_discounted
+
+    def _get_client(self) -> httpx.Client:
+        """Retorna um `httpx.Client` reutilizável (connection pooling)."""
+        if self._http_client is None:
+            with self._client_lock:
+                if self._http_client is None:
+                    self._http_client = httpx.Client(timeout=15.0)
+                    self._owns_http_client = True
+        return self._http_client
+
+    def close(self) -> None:
+        """Fecha o cliente HTTP interno (quando criado por esta instância)."""
+        with self._client_lock:
+            if self._owns_http_client and self._http_client is not None:
+                self._http_client.close()
+                self._http_client = None
+                self._owns_http_client = False
 
     def _has_client_credentials(self) -> bool:
         """Indica se há `APP_ID` e `CLIENT_SECRET` configurados para gerar token."""
@@ -107,89 +149,85 @@ class MercadoLivreClient:
                 "MERCADOLIVRE_APP_ID e MERCADOLIVRE_CLIENT_SECRET no .env."
             )
 
-        self._rate_limiter.wait()
-        url = f"{self.base_url}/oauth/token"
+        with self._token_lock:
+            self._rate_limiter.wait()
+            url = f"{self.base_url}/oauth/token"
 
-        if self._refresh_token:
-            payload = {
-                "grant_type": "refresh_token",
-                "client_id": self._app_id,
-                "client_secret": self._client_secret,
-                "refresh_token": self._refresh_token,
+            if self._refresh_token:
+                payload = {
+                    "grant_type": "refresh_token",
+                    "client_id": self._app_id,
+                    "client_secret": self._client_secret,
+                    "refresh_token": self._refresh_token,
+                }
+            else:
+                payload = {
+                    "grant_type": "client_credentials",
+                    "client_id": self._app_id,
+                    "client_secret": self._client_secret,
+                }
+
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
             }
-        else:
-            payload = {
-                "grant_type": "client_credentials",
-                "client_id": self._app_id,
-                "client_secret": self._client_secret,
-            }
 
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-
-        try:
-            if self._http_client is not None:
-                response = self._http_client.post(
+            try:
+                response = self._get_client().post(
                     url,
                     data=payload,
                     headers=headers,
                     timeout=15.0,
                 )
-            else:
-                with httpx.Client(timeout=15.0) as client:
-                    response = client.post(
-                        url,
-                        data=payload,
-                        headers=headers,
-                    )
-        except httpx.HTTPError as exc:
-            logger.error(
-                "Falha de rede ao solicitar token OAuth do Mercado Livre: %s",
-                type(exc).__name__,
-            )
-            raise SourceAPIError(
-                "Erro de conexão ao autenticar na API do Mercado Livre."
-            ) from exc
-
-        if response.status_code >= 400:
-            error_code = ""
-            try:
-                error_code = str(response.json().get("error") or "")
-            except ValueError:
-                pass
-
-            logger.error(
-                "Falha ao obter token OAuth no Mercado Livre (HTTP %s, erro=%s).",
-                response.status_code,
-                error_code or "desconhecido",
-            )
-            if error_code == "unsupported_grant_type":
-                raise SourceAPIError(
-                    "O Mercado Livre recusou 'client_credentials' (unsupported_grant_type). "
-                    "Ative a opção 'client_credentials' nas configurações da sua aplicação no "
-                    "DevCenter do Mercado Livre."
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "Falha de rede ao solicitar token OAuth do Mercado Livre: %s",
+                    type(exc).__name__,
                 )
-            raise SourceAPIError(
-                f"Não foi possível autenticar no Mercado Livre (HTTP {response.status_code}). "
-                "Verifique suas credenciais no .env."
-            )
+                raise SourceAPIError(
+                    "Erro de conexão ao autenticar na API do Mercado Livre."
+                ) from exc
 
-        data = response.json()
-        new_token = str(data.get("access_token") or "").strip()
-        if not new_token:
-            raise SourceAPIError(
-                "A API do Mercado Livre não retornou um access_token válido."
-            )
+            if response.status_code >= 400:
+                error_code = ""
+                try:
+                    error_code = str(response.json().get("error") or "")
+                except ValueError:
+                    pass
 
-        new_refresh = str(data.get("refresh_token") or "").strip()
-        if new_refresh:
-            self._refresh_token = new_refresh
+                logger.error(
+                    "Falha ao obter token OAuth no Mercado Livre (HTTP %s, erro=%s).",
+                    response.status_code,
+                    error_code or "desconhecido",
+                )
+                if error_code == "unsupported_grant_type":
+                    raise SourceAPIError(
+                        "O Mercado Livre recusou 'client_credentials' (unsupported_grant_type). "
+                        "Ative a opção 'client_credentials' nas configurações da sua aplicação no "
+                        "DevCenter do Mercado Livre."
+                    )
+                raise SourceAPIError(
+                    f"Não foi possível autenticar no Mercado Livre (HTTP {response.status_code}). "
+                    "Verifique suas credenciais no .env."
+                )
 
-        self._access_token = new_token
-        logger.info("Token OAuth 2.0 do Mercado Livre obtido/renovado com sucesso.")
-        return new_token
+            data = response.json()
+            new_token = str(data.get("access_token") or "").strip()
+            if not new_token:
+                raise SourceAPIError(
+                    "A API do Mercado Livre não retornou um access_token válido."
+                )
+
+            new_refresh = str(data.get("refresh_token") or "").strip()
+            if new_refresh:
+                self._refresh_token = new_refresh
+
+            self._access_token = new_token
+            if self._token_store is not None:
+                self._token_store.save(self._access_token, self._refresh_token)
+
+            logger.info("Token OAuth 2.0 do Mercado Livre obtido/renovado com sucesso.")
+            return new_token
 
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Executa uma requisição GET autenticada na API oficial do Mercado Livre."""
@@ -205,22 +243,15 @@ class MercadoLivreClient:
             "Accept": "application/json",
             "Authorization": f"Bearer {self._access_token}",
         }
+        client = self._get_client()
 
         try:
-            if self._http_client is not None:
-                response = self._http_client.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    timeout=15.0,
-                )
-            else:
-                with httpx.Client(timeout=15.0) as client:
-                    response = client.get(
-                        url,
-                        params=params,
-                        headers=headers,
-                    )
+            response = client.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=15.0,
+            )
         except httpx.HTTPError as exc:
             logger.error(
                 "Falha de rede ao consultar API do Mercado Livre: %s",
@@ -234,11 +265,22 @@ class MercadoLivreClient:
             logger.info("Token do Mercado Livre expirado (401). Tentando renovação automática...")
             self.refresh_access_token()
             headers["Authorization"] = f"Bearer {self._access_token}"
-            if self._http_client is not None:
-                response = self._http_client.get(url, params=params, headers=headers, timeout=15.0)
-            else:
-                with httpx.Client(timeout=15.0) as client:
-                    response = client.get(url, params=params, headers=headers)
+            self._rate_limiter.wait()
+            try:
+                response = client.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=15.0,
+                )
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "Falha de rede ao repetir consulta na API do Mercado Livre: %s",
+                    type(exc).__name__,
+                )
+                raise SourceAPIError(
+                    "Erro de conexão ao consultar a API do Mercado Livre."
+                ) from exc
 
         if response.status_code == 401:
             logger.error("Token OAuth expirado ou inválido na API do Mercado Livre (HTTP 401).")
@@ -363,6 +405,7 @@ class MercadoLivreClient:
                 "original_price": listing.get("original_price"),
                 "permalink": permalink,
                 "image_url": extract_primary_image_url(listing) or product_image_url,
+                "product_key": f"mlb-product:{product_id.upper()}",
             }
             if "available_quantity" in listing:
                 merged["available_quantity"] = listing.get("available_quantity")
@@ -425,6 +468,11 @@ class MercadoLivreClient:
         )
 
         image_url = extract_primary_image_url(item)
+        product_key = (
+            str(item.get("product_key") or "").strip()
+            or extract_product_key(permalink, self.source_name)
+            or f"mlb-item:{item_id.upper()}"
+        )
 
         return Offer(
             title=title,
@@ -434,4 +482,5 @@ class MercadoLivreClient:
             source=self.source_name,
             image_url=image_url,
             available_quantity=available_quantity,
+            product_key=product_key,
         )

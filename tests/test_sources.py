@@ -6,10 +6,12 @@ chamadas reais na internet e sem precisar de credenciais comerciais ativas.
 
 import json
 import logging
+from pathlib import Path
 
 import httpx
 import pytest
 
+from pesca_bot.database import OAuthTokenStore
 from pesca_bot.offers import filter_offers
 from pesca_bot.sources import (
     MercadoLivreClient,
@@ -339,5 +341,134 @@ def test_mercadolivre_aplica_parametros_de_afiliado_do_env(
         ofertas[0].url
         == "https://www.mercadolivre.com.br/p/MLB777?matt_word=tralhasecreta&matt_tool=99887766"
     )
+
+
+def test_mercadolivre_persiste_refresh_token_rotacionado_no_sqlite(tmp_path: Path):
+    """Garante que o novo refresh_token OAuth sobreviva entre instâncias sem editar o .env."""
+    banco_tokens = tmp_path / "oauth.db"
+    estado_servidor = {
+        "valid_access": "ACCESS_RENOVADO_V2",
+        "valid_refresh": "REFRESH_SEMENTE_V1",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth/token":
+            body = request.content.decode("utf-8")
+            assert f"refresh_token={estado_servidor['valid_refresh']}" in body
+            estado_servidor["valid_refresh"] = "REFRESH_ROTACIONADO_V2"
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": estado_servidor["valid_access"],
+                    "refresh_token": "REFRESH_ROTACIONADO_V2",
+                },
+            )
+
+        if request.headers.get("authorization") != f"Bearer {estado_servidor['valid_access']}":
+            return httpx.Response(401, json={"message": "expired_token"})
+
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": "MLB901",
+                        "title": "Molinete Daiwa Sweepfire Pesca",
+                        "price": 159.0,
+                        "original_price": 220.0,
+                        "available_quantity": 4,
+                        "permalink": "https://www.mercadolivre.com.br/p/MLB901",
+                    }
+                ]
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    # 1ª instância inicia com access_token expirado do .env -> renova e grava V2 no SQLite
+    store_1 = OAuthTokenStore(
+        provider="mercadolivre",
+        env_access_token="ACCESS_EXPIRADO_V1",
+        env_refresh_token="REFRESH_SEMENTE_V1",
+        db_path=banco_tokens,
+    )
+    client_1 = MercadoLivreClient(
+        access_token="ACCESS_EXPIRADO_V1",
+        app_id="app123",
+        client_secret="sec456",
+        refresh_token="REFRESH_SEMENTE_V1",
+        http_client=httpx.Client(transport=transport),
+        rate_limiter=RateLimiter(0.0),
+        token_store=store_1,
+    )
+    ofertas_1 = client_1.fetch_offers("molinete")
+    assert len(ofertas_1) == 1
+
+    # 2ª instância (simulando reinício com o MESMO .env antigo) carrega V2 do SQLite
+    store_2 = OAuthTokenStore(
+        provider="mercadolivre",
+        env_access_token="ACCESS_EXPIRADO_V1",
+        env_refresh_token="REFRESH_SEMENTE_V1",
+        db_path=banco_tokens,
+    )
+    access_salvo, refresh_salvo = store_2.load()
+    assert access_salvo == "ACCESS_RENOVADO_V2"
+    assert refresh_salvo == "REFRESH_ROTACIONADO_V2"
+
+    # Se o usuário substituir manualmente o token no .env, a nova semente prevalece
+    store_novo_env = OAuthTokenStore(
+        provider="mercadolivre",
+        env_access_token="ACCESS_MANUAL_V3",
+        env_refresh_token="REFRESH_MANUAL_V3",
+        db_path=banco_tokens,
+    )
+    assert store_novo_env.load() == ("ACCESS_MANUAL_V3", "REFRESH_MANUAL_V3")
+
+
+def test_shopee_nao_fabrica_falso_desconto_com_pricemax_de_variacoes():
+    """Garante que anúncios da Shopee com vários SKUs e discount_rate=0 sejam ignorados."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "productOfferV2": {
+                        "nodes": [
+                            {
+                                "itemId": "111",
+                                "productName": "Anzol / Kit Completo Pesca",
+                                "priceMin": "8.00",
+                                "priceMax": "150.00",
+                                "priceDiscountRate": 0,
+                                "offerLink": "https://s.shopee.com.br/var111",
+                                "shopName": "Loja X",
+                            },
+                            {
+                                "itemId": "222",
+                                "productName": "Molinete Shimano FX 2500",
+                                "priceMin": "180.00",
+                                "priceMax": "180.00",
+                                "priceDiscountRate": 20,
+                                "offerLink": "https://s.shopee.com.br/real222",
+                                "shopName": "Loja Y",
+                            },
+                        ]
+                    }
+                }
+            },
+        )
+
+    client = ShopeeAffiliateClient(
+        app_id="id",
+        app_secret="secret",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        rate_limiter=RateLimiter(0.0),
+    )
+
+    ofertas = client.fetch_offers("pesca")
+    assert len(ofertas) == 1
+    assert ofertas[0].title == "Molinete Shimano FX 2500"
+    assert ofertas[0].original_price == 225.0
+    assert ofertas[0].product_key == "shopee:222"
 
 

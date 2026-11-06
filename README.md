@@ -11,12 +11,14 @@ botPython/
 │   └── pesca_bot/          # Pacote principal da aplicação
 │       ├── __init__.py
 │       ├── main.py         # Ponto de entrada da aplicação
-│       ├── telegram_bot.py # Comandos e integração com Telegram
-│       ├── publisher.py    # Publicação com foto (send_photo) e fallback para texto
-│       ├── copywriting.py  # Textos persuasivos e formatação das ofertas
+│       ├── config.py       # Carregamento seguro e hot-reload controlado do .env
+│       ├── affiliate.py    # Links de afiliado Mercado Livre com proteção SSRF
+│       ├── telegram_bot.py # Comandos exclusivos ADM (DM + Stealth) e integração Telegram
+│       ├── publisher.py    # Publicação concorrente segura, foto/fallback e janela 07h-22h BRT
+│       ├── copywriting.py  # Formatação limpa das ofertas preservando URL de afiliado
 │       ├── offers.py       # Modelo padronizado (Offer) e fachada do motor de ofertas
-│       ├── validator.py    # Validação de preços, URLs, imagens e deduplicação
-│       ├── database.py     # Persistência, histórico de preços e registro de publicações (SQLite)
+│       ├── validator.py    # Validação de preços, nicho de pesca, URLs e deduplicação
+│       ├── database.py     # Persistência SQLite (WAL), histórico, cooldown e tokens OAuth
 │       └── sources/        # Pacote de coleta e padronização de fontes
 │           ├── __init__.py
 │           ├── base.py         # Contrato base, seleção de imagem principal e RateLimiter
@@ -38,15 +40,17 @@ botPython/
 └── README.md               # Documentação
 ```
 
-## Personalização das Mensagens (`.env`)
+## Configuração e Segurança (`.env`)
 
-Você pode personalizar o estilo das postagens adicionando estas variáveis opcionais no seu arquivo `.env`:
+Configure as variáveis principais no seu arquivo `.env` (veja `.env.example`):
 
-- `COPY_MAX_EMOJIS=12` — Quantidade máxima de emojis por postagem.
-- `COPY_TONE=comercial` — Tom da comunicação (`comercial`, `direto` ou `neutro`).
-- `COPY_MAX_CAPTION_LENGTH=1024` — Tamanho máximo da legenda (respeita o limite de 1024 caracteres do `send_photo` no Telegram).
-- `COPY_MIN_DISCOUNT_PERCENT=5.0` — Desconto mínimo (%) para usar títulos promocionais fortes.
+- `TELEGRAM_ADMIN_IDS=123456789` — IDs numéricos dos administradores autorizados (separados por vírgula). Todos os comandos funcionam **exclusivamente em chat privado (DM)** para esses IDs (*Modo Stealth + Fail-Closed*). Caso ainda não saiba seu `user_id`, inicie o bot, envie `/start` no privado e copie o `user_id` exibido no aviso do console.
+- `AUTO_PUBLISH_ENABLED=false` — Mantém o envio automático pausado ao iniciar até você ativar (`/retomar` ou `true`).
 - `PUBLISH_INTERVAL_SECONDS=180` — Intervalo em segundos entre cada postagem automática (padrão: 180s = 3 minutos).
+- `COPY_MAX_CAPTION_LENGTH=1024` — Tamanho máximo da legenda (respeita o limite de 1024 caracteres do `send_photo` sem cortar o link de compra).
+- `COPY_MIN_DISCOUNT_PERCENT=5.0` — Desconto real mínimo (%) exigido no Mercado Livre e Shopee.
+- `REPUBLISH_COOLDOWN_DAYS=15` — Dias mínimos antes de permitir republicar o mesmo produto no canal.
+- `REPUBLISH_MIN_PRICE_DROP_PERCENT=10.0` — Queda adicional mínima (%) sobre o último preço postado para antecipar a republicação.
 
 ## Como executar no Windows (PowerShell)
 
