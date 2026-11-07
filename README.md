@@ -46,7 +46,7 @@ Configure as variáveis principais no seu arquivo `.env` (veja `.env.example`):
 
 - `TELEGRAM_ADMIN_IDS=123456789` — IDs numéricos dos administradores autorizados (separados por vírgula). Todos os comandos funcionam **exclusivamente em chat privado (DM)** para esses IDs (*Modo Stealth + Fail-Closed*). Caso ainda não saiba seu `user_id`, inicie o bot, envie `/start` no privado e copie o `user_id` exibido no aviso do console.
 - `AUTO_PUBLISH_ENABLED=false` — Mantém o envio automático pausado ao iniciar até você ativar (`/retomar` ou `true`).
-- `PUBLISH_INTERVAL_SECONDS=180` — Intervalo em segundos entre cada postagem automática (padrão: 180s = 3 minutos).
+- `PUBLISH_INTERVAL_SECONDS=600` — Intervalo em segundos entre cada postagem automática (padrão: 600s = 10 minutos).
 - `COPY_MAX_CAPTION_LENGTH=1024` — Tamanho máximo da legenda (respeita o limite de 1024 caracteres do `send_photo` sem cortar o link de compra).
 - `COPY_MIN_DISCOUNT_PERCENT=5.0` — Desconto real mínimo (%) exigido no Mercado Livre e Shopee.
 - `REPUBLISH_COOLDOWN_DAYS=15` — Dias mínimos antes de permitir republicar o mesmo produto no canal.

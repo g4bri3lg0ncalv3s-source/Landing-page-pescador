@@ -395,11 +395,11 @@ def test_bloqueia_promocoes_apos_22h_e_retoma_as_07h_brasilia(tmp_path: Path):
     assert len(sender.sent_messages) == 1
 
 
-def test_publica_um_post_a_cada_tres_minutos_sem_espamar(
+def test_publica_um_post_a_cada_dez_minutos_sem_espamar(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Garante que o loop periódico envie apenas 1 post por vez com intervalo de 180s (3 min)."""
+    """Garante que o loop periódico envie apenas 1 post por vez com intervalo padrão de 600s (10 min)."""
     monkeypatch.delenv("PUBLISH_INTERVAL_SECONDS", raising=False)
     esperas: list[float] = []
 
@@ -414,7 +414,7 @@ def test_publica_um_post_a_cada_tres_minutos_sem_espamar(
         sleep_func=fake_sleep,
     )
 
-    assert publisher.interval_seconds == 180.0
+    assert publisher.interval_seconds == 600.0
 
     lote_ofertas = [
         Offer(
@@ -433,11 +433,11 @@ def test_publica_um_post_a_cada_tres_minutos_sem_espamar(
         chamadas_coleta[0] += 1
         return lote_ofertas
 
-    # Em 3 ciclos deve enviar exatamente 3 posts (1 por ciclo), aguardando 180s entre cada um
+    # Em 3 ciclos deve enviar exatamente 3 posts (1 por ciclo), aguardando 600s entre cada um
     asyncio.run(publisher.run_periodic_loop(coletar, max_cycles=3))
 
     assert len(sender.sent_messages) == 3
-    assert esperas == [180.0, 180.0]
+    assert esperas == [600.0, 600.0]
     assert chamadas_coleta[0] == 1
 
 
@@ -601,3 +601,117 @@ def test_limpa_fila_pendente_a_noite_e_preserva_id_de_grupo_comum(tmp_path: Path
     assert len(sender.sent_messages) == 2
     assert "Safra 1" in sender.sent_messages[0]["text"]
     assert "Safra 2" in sender.sent_messages[1]["text"]
+
+
+def test_intercala_mercado_livre_e_shopee_mesmo_com_descontos_maiores_na_shopee(
+    tmp_path: Path,
+):
+    """Evita que descontos altos de várias lojas da Shopee sufoquem o Mercado Livre."""
+    banco_teste = tmp_path / "intercalado.db"
+    relogio = [datetime(2026, 11, 7, 13, 0, 0, tzinfo=BRASILIA_TZ)]
+
+    async def avancar_10_min(segundos: float) -> None:
+        from datetime import timedelta
+
+        relogio[0] = relogio[0] + timedelta(seconds=segundos)
+
+    def coletar_lote_misto() -> list[Offer]:
+        # Shopee com descontos enormes (70% e 65%) em lojas diferentes vs ML com 12% e 10%
+        return [
+            Offer(
+                title="Carretilha Pesca Perfil Baixo Shopee A",
+                price=60.0,
+                original_price=200.0,  # 70% OFF
+                url="https://s.shopee.com.br/itemA",
+                source="Shopee (Loja Joyfox)",
+                product_key="shopee:101",
+            ),
+            Offer(
+                title="Vara De Pesca Carbono Shopee B",
+                price=70.0,
+                original_price=200.0,  # 65% OFF
+                url="https://s.shopee.com.br/itemB",
+                source="Shopee (Loja Sougayilang)",
+                product_key="shopee:102",
+            ),
+            Offer(
+                title="Molinete Shimano FX 4000 Pesca ML 1",
+                price=176.0,
+                original_price=200.0,  # 12% OFF
+                url="https://www.mercadolivre.com.br/p/MLB1001",
+                source="Mercado Livre",
+                product_key="mlb-product:MLB1001",
+            ),
+            Offer(
+                title="Alicate De Pesca Contenção ML 2",
+                price=90.0,
+                original_price=100.0,  # 10% OFF
+                url="https://www.mercadolivre.com.br/p/MLB1002",
+                source="Mercado Livre",
+                product_key="mlb-product:MLB1002",
+            ),
+        ]
+
+    sender = SimulatedChannelSender(has_permission=True)
+    publisher = OfferPublisher(
+        sender=sender,
+        channel_id="-1003913046292",
+        db_path=banco_teste,
+        sleep_func=avancar_10_min,
+        now_func=lambda: relogio[0],
+    )
+
+    # Roda 4 ciclos de 10 min (passando inclusive pela expiração de 30 min da fila!)
+    asyncio.run(publisher.run_periodic_loop(coletar_lote_misto, max_cycles=4))
+
+    assert len(sender.sent_messages) == 4
+    textos = [m["text"] for m in sender.sent_messages]
+    # Ciclo 1: Shopee A (70%) -> Ciclo 2: ML 1 (12%) -> Ciclo 3: Shopee B (65%) -> Ciclo 4 (após refresh de 30m!): ML 2 (10%)
+    assert "Shopee A" in textos[0]
+    assert "ML 1" in textos[1]
+    assert "Shopee B" in textos[2]
+    assert "ML 2" in textos[3]
+
+    # Simula reinício do bot (nova instância lendo última fonte = Mercado Livre no SQLite):
+    # se a última foi Mercado Livre, o próximo post após reiniciar deve priorizar Shopee;
+    # e se a última for Shopee, após reiniciar deve priorizar Mercado Livre!
+    novo_lote = [
+        Offer(
+            title="Linha Multifilamento Pesca Shopee C",
+            price=30.0,
+            original_price=100.0,  # 70% OFF
+            url="https://s.shopee.com.br/itemC",
+            source="Shopee (Outra Loja)",
+            product_key="shopee:103",
+        ),
+        Offer(
+            title="Caixa De Pesca Organizadora ML 3",
+            price=85.0,
+            original_price=100.0,  # 15% OFF
+            url="https://www.mercadolivre.com.br/p/MLB1003",
+            source="Mercado Livre",
+            product_key="mlb-product:MLB1003",
+        ),
+    ]
+    sender_reinicio = SimulatedChannelSender(has_permission=True)
+    publisher_reinicio = OfferPublisher(
+        sender=sender_reinicio,
+        channel_id="-1003913046292",
+        db_path=banco_teste,
+        now_func=lambda: relogio[0],
+    )
+    # Última publicação no banco foi ML 2 -> primeiro post após reinício é Shopee C
+    pub_1 = asyncio.run(publisher_reinicio.publish_approved_offers(novo_lote, max_offers=1))
+    assert len(pub_1) == 1
+    assert "Shopee C" in pub_1[0].title
+
+    # Novo reinício agora que a última no banco é Shopee C -> primeiro post deve ser ML 3!
+    publisher_reinicio_2 = OfferPublisher(
+        sender=sender_reinicio,
+        channel_id="-1003913046292",
+        db_path=banco_teste,
+        now_func=lambda: relogio[0],
+    )
+    pub_2 = asyncio.run(publisher_reinicio_2.publish_approved_offers(novo_lote, max_offers=1))
+    assert len(pub_2) == 1
+    assert "ML 3" in pub_2[0].title

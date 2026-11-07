@@ -216,6 +216,7 @@ def test_filtro_de_nicho_aprova_pesca_e_barra_falsos_positivos():
     assert is_fishing_niche("Brinquedo Jogo Pega Peixe Infantil") is False
     assert is_fishing_niche("Bolsa Feminina Maternidade Impermeável") is False
     assert is_fishing_niche("Alicate De Unha Manicure Inox") is False
+    assert is_fishing_niche("Mini Alicate Bico Redondo | Pesca Artesanato Bijuterias") is False
 
 
 def test_deduplica_ignorando_matt_params_e_preserva_link_comissao_e_desconto_minimo():
@@ -275,3 +276,28 @@ def test_deduplica_ignorando_matt_params_e_preserva_link_comissao_e_desconto_min
     assert filtradas[0].price == 179.0
     assert "matt_word=pesca" in filtradas[0].url
     assert "matt_tool=10" in filtradas[0].url
+
+
+def test_deduplica_mesmo_titulo_em_lojas_diferentes_da_shopee():
+    """Evita publicar duas vezes seguidas o mesmo anúncio copiado em lojas distintas da Shopee."""
+    loja_a = Offer(
+        title="Carretilha De Pesca Marine Sports 18 Rolamentos",
+        price=120.0,
+        original_price=240.0,
+        url="https://s.shopee.com.br/lojaA1",
+        source="Shopee (Loja A)",
+        product_key="shopee:111",
+    )
+    loja_b_mais_barata = Offer(
+        title="Carretilha De Pesca Marine Sports 18 Rolamentos",
+        price=105.0,
+        original_price=240.0,
+        url="https://s.shopee.com.br/lojaB2",
+        source="Shopee (Loja B)",
+        product_key="shopee:222",
+    )
+
+    unicas = deduplicate_offers([loja_a, loja_b_mais_barata])
+    assert len(unicas) == 1
+    assert unicas[0].price == 105.0
+    assert unicas[0].url == "https://s.shopee.com.br/lojaB2"

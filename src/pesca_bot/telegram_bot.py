@@ -34,7 +34,13 @@ from pesca_bot.database import (
     save_offer,
     should_publish_offer,
 )
-from pesca_bot.offers import Offer, filter_offers, format_offer, is_valid_image_url
+from pesca_bot.offers import (
+    Offer,
+    filter_offers,
+    format_offer,
+    interleave_offers_by_source,
+    is_valid_image_url,
+)
 from pesca_bot.publisher import (
     DEFAULT_MIN_DISCOUNT_PERCENT,
     DEFAULT_REPUBLISH_COOLDOWN_DAYS,
@@ -522,10 +528,12 @@ async def ofertas(
         min_value=0.0,
     )
     raw_offers = await asyncio.to_thread(collect_offers)
-    valid_offers = filter_offers(
-        raw_offers,
-        min_discount_percent=min_discount,
-        require_fishing_niche=True,
+    valid_offers = interleave_offers_by_source(
+        filter_offers(
+            raw_offers,
+            min_discount_percent=min_discount,
+            require_fishing_niche=True,
+        )
     )
 
     if not valid_offers:

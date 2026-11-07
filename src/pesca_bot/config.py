@@ -19,7 +19,17 @@ from dotenv import dotenv_values
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def _detect_project_root() -> Path:
+    """Localiza a pasta raiz do projeto tanto em modo fonte (`src/`) quanto instalado."""
+    source_candidate = Path(__file__).resolve().parents[2]
+    if (source_candidate / "pyproject.toml").exists() or (
+        source_candidate / ".env"
+    ).exists():
+        return source_candidate
+    return Path.cwd().resolve()
+
+
+PROJECT_ROOT = _detect_project_root()
 ENV_FILE = PROJECT_ROOT / ".env"
 
 # Fotografia das variáveis que já existiam no ambiente real ANTES de qualquer

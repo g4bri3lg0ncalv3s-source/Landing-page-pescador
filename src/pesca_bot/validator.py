@@ -262,6 +262,8 @@ FISHING_NEGATIVE_TERMS = (
     "batom",
     "cosmetico",
     "bijuteria",
+    "bijuterias",
+    "artesanato",
     "brinco",
     "bolsa feminina",
     "maternidade",
@@ -316,12 +318,90 @@ def is_fishing_niche(title: str) -> bool:
     return any(_contains_term(normalized, term) for term in FISHING_POSITIVE_TERMS)
 
 
+def detect_offer_platform(offer_or_source: Offer | str, url: str = "") -> str:
+    """Identifica a plataforma/marketplace canônico da oferta.
+
+    Unifica variações de vendedores dentro do mesmo marketplace (por exemplo,
+    `"Shopee (Loja A)"` e `"Shopee (Loja B)"` tornam-se `"shopee"`), evitando
+    que múltiplas lojas de um mesmo marketplace monopolizem a fila de postagens.
+    """
+    if isinstance(offer_or_source, Offer):
+        raw_source = offer_or_source.source or ""
+        raw_url = url or offer_or_source.url or ""
+    else:
+        raw_source = offer_or_source or ""
+        raw_url = url or ""
+
+    source_norm = " ".join(raw_source.casefold().split())
+    url_norm = raw_url.casefold()
+
+    if (
+        "mercado livre" in source_norm
+        or "mercadolivre" in source_norm
+        or "mercadolibre" in source_norm
+        or "mercadolivre" in url_norm
+        or "mercadolibre" in url_norm
+        or "meli.la" in url_norm
+    ):
+        return "mercadolivre"
+
+    if "shopee" in source_norm or "shopee" in url_norm:
+        return "shopee"
+
+    return source_norm or "desconhecido"
+
+
+def interleave_offers_by_source(
+    offers: list[Offer],
+    last_platform: str | None = None,
+) -> list[Offer]:
+    """Intercala ofertas em round-robin entre plataformas (ex.: Mercado Livre e Shopee).
+
+    Mantém a ordem interna de qualidade/desconto de cada plataforma, mas alterna
+    1 oferta de cada fonte por rodada. Quando `last_platform` é informado,
+    rotaciona a ordem inicial para que a próxima publicação priorize uma
+    plataforma diferente da última enviada ao canal.
+    """
+    if len(offers) <= 1:
+        return list(offers)
+
+    buckets: dict[str, list[Offer]] = {}
+    for offer in offers:
+        platform = detect_offer_platform(offer)
+        buckets.setdefault(platform, []).append(offer)
+
+    if len(buckets) <= 1:
+        return list(offers)
+
+    platforms = list(buckets.keys())
+    if last_platform:
+        normalized_last = detect_offer_platform(last_platform)
+        if normalized_last in platforms:
+            idx = platforms.index(normalized_last)
+            platforms = platforms[idx + 1 :] + platforms[: idx + 1]
+
+    interleaved: list[Offer] = []
+    round_idx = 0
+    while True:
+        added_in_round = False
+        for platform in platforms:
+            bucket = buckets[platform]
+            if round_idx < len(bucket):
+                interleaved.append(bucket[round_idx])
+                added_in_round = True
+        if not added_in_round:
+            break
+        round_idx += 1
+
+    return interleaved
+
+
 def deduplicate_offers(offers: list[Offer]) -> list[Offer]:
     """Remove ofertas duplicadas mantendo sempre a opção de menor preço.
 
     Duas ofertas são consideradas o mesmo produto quando compartilham qualquer
     uma destas chaves: URL canônica, identificador do produto (`product_key`)
-    ou o par (título, loja). O link original da oferta (incluindo parâmetros
+    ou o par (título, plataforma). O link original da oferta (incluindo parâmetros
     de afiliado) é preservado no resultado.
     """
     best_by_group: dict[str, Offer] = {}
@@ -333,7 +413,7 @@ def deduplicate_offers(offers: list[Offer]) -> list[Offer]:
             continue
 
         title_key = " ".join(offer.title.casefold().split())
-        source_key = " ".join(offer.source.casefold().split())
+        source_key = detect_offer_platform(offer)
         product_key = (offer.product_key or "").strip() or extract_product_key(
             offer.url, offer.source
         )

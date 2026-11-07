@@ -403,6 +403,36 @@ def get_last_publication(
     }
 
 
+def get_last_published_source(
+    channel_id: str | int,
+    db_path: Path | str | None = None,
+) -> str | None:
+    """Retorna o nome da fonte (`offers.source`) da última publicação feita no canal."""
+    clean_channel = str(channel_id or "").strip()
+    if not clean_channel:
+        return None
+
+    target_path = _resolve_database_path(db_path)
+    initialize_database(target_path)
+
+    with _connect(target_path) as connection:
+        row = connection.execute(
+            """
+            SELECT o.source
+            FROM publications p
+            INNER JOIN offers o ON o.id = p.offer_id
+            WHERE p.channel_id = ?
+            ORDER BY p.published_at DESC, p.id DESC
+            LIMIT 1
+            """,
+            (clean_channel,),
+        ).fetchone()
+
+    if row is None or not row[0]:
+        return None
+    return str(row[0]).strip()
+
+
 def is_offer_published(
     url: str,
     channel_id: str | int,

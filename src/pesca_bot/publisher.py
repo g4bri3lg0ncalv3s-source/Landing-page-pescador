@@ -35,18 +35,26 @@ from telegram.error import (
 from pesca_bot.config import env_float, env_str, load_env, reload_env
 from pesca_bot.database import (
     DATABASE_PATH,
+    get_last_published_source,
     initialize_database,
     record_publication,
     save_offer,
     should_publish_offer,
 )
-from pesca_bot.offers import Offer, filter_offers, format_offer, is_valid_image_url
+from pesca_bot.offers import (
+    Offer,
+    detect_offer_platform,
+    filter_offers,
+    format_offer,
+    interleave_offers_by_source,
+    is_valid_image_url,
+)
 
 logger = logging.getLogger(__name__)
 
 load_env()
 
-DEFAULT_PUBLISH_INTERVAL_SECONDS = 180.0
+DEFAULT_PUBLISH_INTERVAL_SECONDS = 600.0
 DEFAULT_MIN_DISCOUNT_PERCENT = 5.0
 DEFAULT_REPUBLISH_COOLDOWN_DAYS = 15.0
 DEFAULT_REPUBLISH_MIN_PRICE_DROP_PERCENT = 10.0
@@ -337,6 +345,7 @@ class OfferPublisher:
         self._now = now_func
         self._paused = False
         self._publish_lock = asyncio.Lock()
+        self._last_published_platform: str | None = None
 
     def is_operating_hours(self) -> bool:
         """Retorna `True` se o horário atual de Brasília estiver entre 07:00 e 22:00."""
@@ -531,6 +540,21 @@ class OfferPublisher:
             now=self._now(),
         )
 
+    def _resolve_last_platform(self) -> str | None:
+        """Obtém a plataforma da última oferta publicada (em memória ou no SQLite)."""
+        if self._last_published_platform:
+            return self._last_published_platform
+        if not self.channel_id:
+            return None
+        last_source = get_last_published_source(
+            self.channel_id,
+            db_path=self.db_path,
+        )
+        if not last_source:
+            return None
+        self._last_published_platform = detect_offer_platform(last_source)
+        return self._last_published_platform
+
     async def publish_approved_offers(
         self,
         offers: list[Offer],
@@ -573,14 +597,28 @@ class OfferPublisher:
             if not await self.verify_channel_permission():
                 return []
 
-            published_now: list[Offer] = []
-
-            for offer in valid_offers:
-                if not self._can_publish_now(offer):
+            eligible_offers: list[Offer] = []
+            for candidate in valid_offers:
+                if self._can_publish_now(candidate):
+                    eligible_offers.append(candidate)
+                else:
                     logger.info(
                         "Oferta em período de cooldown no canal (ignorando): %s",
-                        offer.url,
+                        candidate.url,
                     )
+
+            if not eligible_offers:
+                return []
+
+            ordered_offers = interleave_offers_by_source(
+                eligible_offers,
+                last_platform=self._resolve_last_platform(),
+            )
+
+            published_now: list[Offer] = []
+
+            for offer in ordered_offers:
+                if not self._can_publish_now(offer):
                     continue
 
                 save_offer(offer, db_path=self.db_path)
@@ -597,6 +635,7 @@ class OfferPublisher:
                     db_path=self.db_path,
                     published_at=self._now(),
                 )
+                self._last_published_platform = detect_offer_platform(offer)
                 logger.info(
                     "Oferta publicada com sucesso no canal %s: %s (msg_id=%s)",
                     self.channel_id,
@@ -615,7 +654,7 @@ class OfferPublisher:
         fetch_offers_callback: Callable[[], list[Offer]],
         max_cycles: int | None = None,
     ) -> None:
-        """Publica no máximo 1 oferta elegível a cada `interval_seconds` (padrão: 180s = 3 min)."""
+        """Publica no máximo 1 oferta elegível a cada `interval_seconds` (padrão: 600s = 10 min)."""
         cycles = 0
         pending_offers: list[Offer] = []
         pending_fetched_at: datetime | None = None
